@@ -1,6 +1,724 @@
-# WhatsApp Analytics
+CREATE OR REPLACE VIEW ak_analytics.whatsapp_sessions_raw AS
+WITH ordered AS (
+  SELECT
+    m.client_id,
+    m.wa_message_id,
+    m.sent_at,
+    m.content,
+    m.is_from_client,
+    LAG(m.sent_at) OVER (
+      PARTITION BY m.client_id
+      ORDER BY m.sent_at, m.wa_message_id
+    ) AS prev_sent_at
+  FROM ak_analytics.whatsapp_messages AS m
+)
+SELECT
+  client_id,
+  wa_message_id,
+  sent_at,
+  content,
+  is_from_client,
+  prev_sent_at,
+  CASE
+    WHEN prev_sent_at IS NULL THEN 1
+    WHEN sent_at - prev_sent_at > INTERVAL '10 minutes' THEN 1
+    ELSE 0
+  END AS new_session_flag,
+  SUM(
+    CASE
+      WHEN prev_sent_at IS NULL THEN 1
+      WHEN sent_at - prev_sent_at > INTERVAL '10 minutes' THEN 1
+      ELSE 0
+    END
+  ) OVER (
+    PARTITION BY client_id
+    ORDER BY sent_at, wa_message_id
+    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+  ) AS session_id
+FROM ordered;
 
-SQL views and logic for WhatsApp message analysis:
-- Session detection
-- Monthly activity matrix
-- Response time (SLA) metrics
+
+
+CREATE OR REPLACE VIEW ak_analytics.whatsapp_sessions AS
+WITH base AS (
+  SELECT
+    r.client_id,
+    r.session_id,
+    r.wa_message_id,
+    r.sent_at,
+    r.is_from_client,
+    ROW_NUMBER() OVER (
+      PARTITION BY r.client_id, r.session_id
+      ORDER BY r.sent_at, r.wa_message_id
+    ) AS rn
+  FROM ak_analytics.whatsapp_sessions_raw AS r
+)
+SELECT
+  client_id,
+  session_id,
+  MIN(sent_at) AS session_start,
+  MAX(sent_at) AS session_end,
+  COUNT(*) AS messages_in_session,
+  COUNT(*) FILTER (WHERE is_from_client) AS messages_from_client_in_session,
+  COUNT(*) FILTER (WHERE NOT is_from_client) AS messages_to_client_in_session,
+  MAX(CASE WHEN rn = 1 AND is_from_client THEN 1 ELSE 0 END) = 1 AS client_started_session
+FROM base
+GROUP BY client_id, session_id;
+
+
+
+CREATE OR REPLACE VIEW ak_analytics.whatsapp_sessions_business AS
+SELECT
+  s.client_id,
+  s.session_id,
+  s.session_start,
+  s.session_end,
+  s.messages_in_session,
+  s.messages_from_client_in_session,
+  s.messages_to_client_in_session,
+  s.client_started_session,
+  s.session_start::DATE AS session_date,
+  DATE_TRUNC('month', s.session_start)::DATE AS session_month,
+  (
+    EXTRACT(HOUR FROM s.session_start) BETWEEN 9 AND 19
+    AND (
+      -- ראשון–חמישי
+      EXTRACT(DOW FROM s.session_start) BETWEEN 0 AND 4
+      -- שישי עד 13:00
+      OR (
+        EXTRACT(DOW FROM s.session_start) = 5
+        AND EXTRACT(HOUR FROM s.session_start) < 13
+      )
+    )
+  ) AS is_in_working_window
+FROM ak_analytics.whatsapp_sessions AS s;
+
+
+
+CREATE OR REPLACE VIEW ak_analytics.whatsapp_monthly_session_matrix_2025 AS
+WITH sessions_2025 AS (
+  SELECT
+    client_id,
+    DATE_TRUNC('month', session_start)::DATE AS session_month,
+    COUNT(*) AS sessions_count,
+    COUNT(*) FILTER (WHERE client_started_session) AS sessions_started_by_client
+  FROM ak_analytics.whatsapp_sessions_business
+  WHERE session_start >= TIMESTAMP '2025-06-01'
+    AND session_start <  TIMESTAMP '2026-01-01'
+    AND is_in_working_window
+  GROUP BY client_id, DATE_TRUNC('month', session_start)::DATE
+),
+pivoted AS (
+  SELECT
+    client_id,
+    SUM(sessions_count) FILTER (WHERE session_month = DATE '2025-06-01') AS june_2025_sessions,
+    SUM(sessions_count) FILTER (WHERE session_month = DATE '2025-07-01') AS july_2025_sessions,
+    SUM(sessions_count) FILTER (WHERE session_month = DATE '2025-08-01') AS august_2025_sessions,
+    SUM(sessions_count) FILTER (WHERE session_month = DATE '2025-09-01') AS september_2025_sessions,
+    SUM(sessions_count) FILTER (WHERE session_month = DATE '2025-10-01') AS october_2025_sessions,
+    SUM(sessions_count) FILTER (WHERE session_month = DATE '2025-11-01') AS november_2025_sessions,
+    SUM(sessions_count) FILTER (WHERE session_month = DATE '2025-12-01') AS december_2025_sessions,
+    MIN(session_month) AS first_active_month,
+    MAX(session_month) AS last_active_month,
+    COUNT(*) AS active_months_raw
+  FROM sessions_2025
+  GROUP BY client_id
+)
+SELECT
+  client_id,
+  june_2025_sessions,
+  july_2025_sessions,
+  august_2025_sessions,
+  september_2025_sessions,
+  october_2025_sessions,
+  november_2025_sessions,
+  december_2025_sessions,
+  (COALESCE(june_2025_sessions, 0)
+   + COALESCE(july_2025_sessions, 0)
+   + COALESCE(august_2025_sessions, 0)
+   + COALESCE(september_2025_sessions, 0)
+   + COALESCE(october_2025_sessions, 0)
+   + COALESCE(november_2025_sessions, 0)
+   + COALESCE(december_2025_sessions, 0)
+  ) AS total_sessions_2025,
+  active_months_raw AS active_months_2025,
+  CASE
+    WHEN first_active_month IS NOT NULL AND last_active_month IS NOT NULL THEN
+      (
+        (EXTRACT(YEAR FROM last_active_month)::INT - EXTRACT(YEAR FROM first_active_month)::INT) * 12
+        + (EXTRACT(MONTH FROM last_active_month)::INT - EXTRACT(MONTH FROM first_active_month)::INT)
+        + 1
+      )
+    ELSE NULL
+  END AS months_in_range_2025,
+  CASE
+    WHEN active_months_raw > 0 THEN
+      (COALESCE(june_2025_sessions, 0)
+       + COALESCE(july_2025_sessions, 0)
+       + COALESCE(august_2025_sessions, 0)
+       + COALESCE(september_2025_sessions, 0)
+       + COALESCE(october_2025_sessions, 0)
+       + COALESCE(november_2025_sessions, 0)
+       + COALESCE(december_2025_sessions, 0)
+      )::NUMERIC / active_months_raw
+    ELSE NULL
+  END AS avg_sessions_per_active_month
+FROM pivoted;
+
+
+
+CREATE OR REPLACE VIEW ak_analytics.whatsapp_response_pairs AS
+WITH client_neighbor_flags AS (
+  SELECT
+    sr.client_id,
+    sr.wa_message_id,
+    LAG(sr.is_from_client) OVER (
+      PARTITION BY sr.client_id
+      ORDER BY sr.sent_at, sr.wa_message_id
+    ) AS prev_is_from_client,
+    LEAD(sr.is_from_client) OVER (
+      PARTITION BY sr.client_id
+      ORDER BY sr.sent_at, sr.wa_message_id
+    ) AS next_is_from_client
+  FROM ak_analytics.whatsapp_sessions_raw AS sr
+),
+
+base_client_msgs AS (
+  SELECT
+    m.client_id,
+    m.wa_message_id,
+    m.sent_at AS client_sent_at,
+    m.content,
+    sr.session_id,
+    (
+      COALESCE(nf.prev_is_from_client, FALSE)
+      OR COALESCE(nf.next_is_from_client, FALSE)
+    ) AS is_in_multi_client_run
+  FROM ak_analytics.whatsapp_messages AS m
+  LEFT JOIN ak_analytics.whatsapp_sessions_raw AS sr
+    ON sr.client_id     = m.client_id
+   AND sr.wa_message_id = m.wa_message_id
+  LEFT JOIN client_neighbor_flags AS nf
+    ON nf.client_id     = sr.client_id
+   AND nf.wa_message_id = sr.wa_message_id
+  WHERE m.is_from_client = TRUE
+),
+
+session_counts AS (
+  SELECT
+    sr.client_id,
+    sr.session_id,
+    COUNT(*) FILTER (WHERE sr.is_from_client = TRUE)  AS client_msg_count,
+    COUNT(*) FILTER (WHERE sr.is_from_client = FALSE) AS staff_msg_count
+  FROM ak_analytics.whatsapp_sessions_raw AS sr
+  GROUP BY sr.client_id, sr.session_id
+),
+
+last_client_in_session AS (
+  SELECT
+    x.client_id,
+    x.session_id,
+    x.wa_message_id AS last_client_message_id
+  FROM (
+    SELECT
+      sr.client_id,
+      sr.session_id,
+      sr.wa_message_id,
+      sr.sent_at,
+      ROW_NUMBER() OVER (
+        PARTITION BY sr.client_id, sr.session_id
+        ORDER BY sr.sent_at DESC, sr.wa_message_id DESC
+      ) AS rn
+    FROM ak_analytics.whatsapp_sessions_raw AS sr
+    WHERE sr.is_from_client = TRUE
+  ) AS x
+  WHERE x.rn = 1
+),
+
+big_sessions AS (
+  SELECT
+    sc.client_id,
+    sc.session_id,
+    l.last_client_message_id
+  FROM session_counts AS sc
+  JOIN last_client_in_session AS l
+    ON l.client_id  = sc.client_id
+   AND l.session_id = sc.session_id
+  WHERE sc.client_msg_count  >= 4
+    AND sc.staff_msg_count   >= 4
+),
+
+client_msgs_classified AS (
+  SELECT
+    b.client_id,
+    b.wa_message_id   AS client_message_id,
+    b.client_sent_at,
+    b.content,
+    b.session_id,
+    b.is_in_multi_client_run,
+    CASE
+      WHEN TRIM(COALESCE(b.content, '')) = '' THEN TRUE
+      ELSE
+        (
+          (
+            CASE
+              WHEN TRIM(COALESCE(b.content, '')) = '' THEN 0
+              ELSE ARRAY_LENGTH(
+                     REGEXP_SPLIT_TO_ARRAY(TRIM(b.content), E'\\s+'),
+                     1
+                   )
+            END
+          ) <= 3
+          AND POSITION('?' IN COALESCE(b.content, '')) = 0
+          AND b.is_in_multi_client_run = FALSE
+        )
+    END AS is_small_no_question,
+    CASE
+      WHEN bs.last_client_message_id IS NOT NULL
+           AND bs.last_client_message_id = b.wa_message_id
+      THEN TRUE
+      ELSE FALSE
+    END AS is_last_in_big_session
+  FROM base_client_msgs AS b
+  LEFT JOIN big_sessions AS bs
+    ON bs.client_id  = b.client_id
+   AND bs.session_id = b.session_id
+),
+
+eligible_client_msgs AS (
+  SELECT
+    c.client_id,
+    c.client_message_id,
+    c.client_sent_at
+  FROM client_msgs_classified AS c
+  WHERE
+    NOT c.is_small_no_question
+    AND NOT c.is_last_in_big_session
+    AND EXTRACT(HOUR FROM c.client_sent_at) BETWEEN 9 AND 19
+    AND (
+      EXTRACT(DOW FROM c.client_sent_at) BETWEEN 0 AND 4
+      OR (
+        EXTRACT(DOW FROM c.client_sent_at) = 5
+        AND EXTRACT(HOUR FROM c.client_sent_at) < 13
+      )
+    )
+),
+
+paired AS (
+  SELECT
+    e.client_id,
+    e.client_message_id,
+    e.client_sent_at,
+    (
+      SELECT m_reply.sent_at
+      FROM ak_analytics.whatsapp_messages AS m_reply
+      WHERE m_reply.client_id      = e.client_id
+        AND m_reply.is_from_client = FALSE
+        AND m_reply.sent_at        > e.client_sent_at
+      ORDER BY m_reply.sent_at
+      LIMIT 1
+    ) AS reply_at
+  FROM eligible_client_msgs AS e
+),
+
+filtered AS (
+  SELECT
+    *,
+    client_sent_at::DATE AS start_date,
+    reply_at::DATE       AS end_date
+  FROM paired
+  WHERE reply_at IS NOT NULL
+),
+
+per_day AS (
+  SELECT
+    f.client_id,
+    f.client_message_id,
+    f.client_sent_at,
+    f.reply_at,
+    d::DATE AS day,
+    EXTRACT(DOW FROM d) AS dow,
+    CASE
+      WHEN EXTRACT(DOW FROM d) BETWEEN 0 AND 4 THEN (d::DATE + TIME '09:00')::TIMESTAMP
+      WHEN EXTRACT(DOW FROM d) = 5              THEN (d::DATE + TIME '09:00')::TIMESTAMP
+      ELSE NULL
+    END AS working_start,
+    CASE
+      WHEN EXTRACT(DOW FROM d) BETWEEN 0 AND 4 THEN (d::DATE + TIME '20:00')::TIMESTAMP
+      WHEN EXTRACT(DOW FROM d) = 5              THEN (d::DATE + TIME '13:00')::TIMESTAMP
+      ELSE NULL
+    END AS working_end
+  FROM filtered AS f
+  CROSS JOIN LATERAL GENERATE_SERIES(
+    f.start_date,
+    f.end_date,
+    INTERVAL '1 day'
+  ) AS d
+),
+
+per_day_clipped AS (
+  SELECT
+    client_id,
+    client_message_id,
+    client_sent_at,
+    reply_at,
+    day,
+    CASE
+      WHEN working_start IS NULL OR working_end IS NULL THEN 0
+      ELSE GREATEST(
+        0,
+        EXTRACT(
+          EPOCH FROM (
+            LEAST(working_end, reply_at)
+            - GREATEST(working_start, client_sent_at)
+          )
+        ) / 60.0
+      )
+    END AS minutes_in_day
+  FROM per_day
+),
+
+agg AS (
+  SELECT
+    client_id,
+    client_message_id,
+    MIN(client_sent_at) AS client_sent_at,
+    MIN(reply_at)       AS reply_at,
+    SUM(minutes_in_day) AS response_minutes_working
+  FROM per_day_clipped
+  GROUP BY client_id, client_message_id
+),
+
+with_penalty AS (
+  SELECT
+    a.*,
+    CASE
+      WHEN
+        CAST(a.client_sent_at AS TIME) <= TIME '19:00'
+        AND a.reply_at::DATE = a.client_sent_at::DATE + 1
+        AND CAST(a.reply_at AS TIME)   >= TIME '10:00'
+      THEN 30.0
+      ELSE 0.0
+    END AS penalty_minutes
+  FROM agg AS a
+)
+
+SELECT
+  client_id,
+  client_message_id,
+  client_sent_at,
+  reply_at,
+  response_minutes_working,
+  response_minutes_working + penalty_minutes               AS response_minutes_effective,
+  LEAST(response_minutes_working + penalty_minutes, 360.0) AS response_minutes_capped
+FROM with_penalty;
+
+
+
+
+CREATE OR REPLACE VIEW ak_analytics.whatsapp_response_metrics AS
+WITH params AS (
+  SELECT
+    CURRENT_DATE AS today,
+    (NOW() AT TIME ZONE 'Asia/Jerusalem') AS now_local
+),
+
+/******** 1. מדדים להודעות שנענו – מבוסס על whatsapp_response_pairs ********/
+
+answered_base AS (
+  SELECT
+    rp.client_id,
+    rp.client_sent_at,
+    rp.response_minutes_capped
+  FROM ak_analytics.whatsapp_response_pairs AS rp
+),
+
+answered_ordered AS (
+  SELECT
+    b.*,
+    ROW_NUMBER() OVER (
+      PARTITION BY b.client_id
+      ORDER BY b.client_sent_at DESC
+    ) AS rn
+  FROM answered_base AS b
+),
+
+answered_metrics AS (
+  SELECT
+    o.client_id,
+    AVG(o.response_minutes_capped) AS avg_response_minutes_all,
+    AVG(o.response_minutes_capped) FILTER (
+      WHERE o.client_sent_at::DATE >= (SELECT today FROM params) - INTERVAL '30 days'
+    ) AS avg_response_minutes_30d,
+    AVG(o.response_minutes_capped) FILTER (
+      WHERE o.client_sent_at::DATE >= (SELECT today FROM params) - INTERVAL '7 days'
+    ) AS avg_response_minutes_7d,
+    MAX(
+      CASE WHEN o.rn = 1 THEN o.response_minutes_capped END
+    ) AS last_response_minutes
+  FROM answered_ordered AS o
+  GROUP BY o.client_id
+),
+
+/******** 2. הודעה אחרונה שדורשת תשובה ועדיין לא נענתה (PENDING) ********/
+
+client_neighbor_flags_p AS (
+  SELECT
+    sr.client_id,
+    sr.wa_message_id,
+    LAG(sr.is_from_client) OVER (
+      PARTITION BY sr.client_id
+      ORDER BY sr.sent_at, sr.wa_message_id
+    ) AS prev_is_from_client,
+    LEAD(sr.is_from_client) OVER (
+      PARTITION BY sr.client_id
+      ORDER BY sr.sent_at, sr.wa_message_id
+    ) AS next_is_from_client
+  FROM ak_analytics.whatsapp_sessions_raw AS sr
+),
+
+base_client_msgs_p AS (
+  SELECT
+    m.client_id,
+    m.wa_message_id,
+    m.sent_at,
+    m.content,
+    sr.session_id,
+    (
+      COALESCE(nf.prev_is_from_client, FALSE)
+      OR COALESCE(nf.next_is_from_client, FALSE)
+    ) AS is_in_multi_client_run
+  FROM ak_analytics.whatsapp_messages AS m
+  LEFT JOIN ak_analytics.whatsapp_sessions_raw AS sr
+    ON sr.client_id     = m.client_id
+   AND sr.wa_message_id = m.wa_message_id
+  LEFT JOIN client_neighbor_flags_p AS nf
+    ON nf.client_id     = sr.client_id
+   AND nf.wa_message_id = sr.wa_message_id
+  WHERE m.is_from_client = TRUE
+),
+
+session_counts_p AS (
+  SELECT
+    sr.client_id,
+    sr.session_id,
+    COUNT(*) FILTER (WHERE sr.is_from_client = TRUE)  AS client_msg_count,
+    COUNT(*) FILTER (WHERE sr.is_from_client = FALSE) AS staff_msg_count
+  FROM ak_analytics.whatsapp_sessions_raw AS sr
+  GROUP BY sr.client_id, sr.session_id
+),
+
+last_client_in_session_p AS (
+  SELECT
+    x.client_id,
+    x.session_id,
+    x.wa_message_id AS last_client_message_id
+  FROM (
+    SELECT
+      sr.client_id,
+      sr.session_id,
+      sr.wa_message_id,
+      sr.sent_at,
+      ROW_NUMBER() OVER (
+        PARTITION BY sr.client_id, sr.session_id
+        ORDER BY sr.sent_at DESC, sr.wa_message_id DESC
+      ) AS rn
+    FROM ak_analytics.whatsapp_sessions_raw AS sr
+    WHERE sr.is_from_client = TRUE
+  ) AS x
+  WHERE x.rn = 1
+),
+
+big_sessions_p AS (
+  SELECT
+    sc.client_id,
+    sc.session_id,
+    l.last_client_message_id
+  FROM session_counts_p AS sc
+  JOIN last_client_in_session_p AS l
+    ON l.client_id  = sc.client_id
+   AND l.session_id = sc.session_id
+  WHERE sc.client_msg_count  >= 4
+    AND sc.staff_msg_count   >= 4
+),
+
+client_msgs_classified_p AS (
+  SELECT
+    b.client_id,
+    b.wa_message_id   AS client_message_id,
+    b.sent_at         AS client_sent_at,
+    b.content,
+    b.session_id,
+    b.is_in_multi_client_run,
+    CASE
+      WHEN TRIM(COALESCE(b.content, '')) = '' THEN TRUE
+      ELSE
+        (
+          (
+            CASE
+              WHEN TRIM(COALESCE(b.content, '')) = '' THEN 0
+              ELSE ARRAY_LENGTH(
+                     REGEXP_SPLIT_TO_ARRAY(TRIM(b.content), E'\\s+'),
+                     1
+                   )
+            END
+          ) <= 3
+          AND POSITION('?' IN COALESCE(b.content, '')) = 0
+          AND b.is_in_multi_client_run = FALSE
+        )
+    END AS is_small_no_question,
+    CASE
+      WHEN bs.last_client_message_id IS NOT NULL
+           AND bs.last_client_message_id = b.wa_message_id
+      THEN TRUE
+      ELSE FALSE
+    END AS is_last_in_big_session
+  FROM base_client_msgs_p AS b
+  LEFT JOIN big_sessions_p AS bs
+    ON bs.client_id  = b.client_id
+   AND bs.session_id = b.session_id
+),
+
+eligible_client_msgs_p AS (
+  SELECT
+    c.client_id,
+    c.client_message_id,
+    c.client_sent_at
+  FROM client_msgs_classified_p AS c
+  WHERE
+    NOT c.is_small_no_question
+    AND NOT c.is_last_in_big_session
+    AND EXTRACT(HOUR FROM c.client_sent_at) BETWEEN 9 AND 19
+    AND (
+      EXTRACT(DOW FROM c.client_sent_at) BETWEEN 0 AND 4
+      OR (
+        EXTRACT(DOW FROM c.client_sent_at) = 5
+        AND EXTRACT(HOUR FROM c.client_sent_at) < 13
+      )
+    )
+),
+
+pending_candidates AS (
+  SELECT
+    e.client_id,
+    e.client_message_id,
+    e.client_sent_at
+  FROM eligible_client_msgs_p AS e
+  WHERE NOT EXISTS (
+    SELECT 1
+    FROM ak_analytics.whatsapp_messages AS m_reply
+    WHERE m_reply.client_id      = e.client_id
+      AND m_reply.is_from_client = FALSE
+      AND m_reply.sent_at        > e.client_sent_at
+  )
+),
+
+pending_latest AS (
+  SELECT
+    p.client_id,
+    p.client_message_id,
+    p.client_sent_at,
+    ROW_NUMBER() OVER (
+      PARTITION BY p.client_id
+      ORDER BY p.client_sent_at DESC, p.client_message_id DESC
+    ) AS rn
+  FROM pending_candidates AS p
+),
+
+last_message_overall AS (
+  SELECT
+    x.client_id,
+    x.wa_message_id AS last_wa_message_id,
+    x.sent_at       AS last_sent_at
+  FROM (
+    SELECT
+      m.client_id,
+      m.wa_message_id,
+      m.sent_at,
+      ROW_NUMBER() OVER (
+        PARTITION BY m.client_id
+        ORDER BY m.sent_at DESC, m.wa_message_id DESC
+      ) AS rn
+    FROM ak_analytics.whatsapp_messages AS m
+  ) AS x
+  WHERE x.rn = 1
+),
+
+pending_aligned AS (
+  SELECT
+    pl.client_id,
+    pl.client_message_id,
+    pl.client_sent_at
+  FROM pending_latest AS pl
+  JOIN last_message_overall AS lm
+    ON lm.client_id          = pl.client_id
+   AND lm.last_wa_message_id = pl.client_message_id
+  WHERE pl.rn = 1
+),
+
+pending_per_day AS (
+  SELECT
+    pa.client_id,
+    pa.client_message_id,
+    pa.client_sent_at,
+    (SELECT now_local FROM params) AS now_local,
+    d::DATE AS day,
+    EXTRACT(DOW FROM d) AS dow,
+    CASE
+      WHEN EXTRACT(DOW FROM d) BETWEEN 0 AND 4 THEN (d::DATE + TIME '09:00')::TIMESTAMP
+      WHEN EXTRACT(DOW FROM d) = 5              THEN (d::DATE + TIME '09:00')::TIMESTAMP
+      ELSE NULL
+    END AS working_start,
+    CASE
+      WHEN EXTRACT(DOW FROM d) BETWEEN 0 AND 4 THEN (d::DATE + TIME '20:00')::TIMESTAMP
+      WHEN EXTRACT(DOW FROM d) = 5              THEN (d::DATE + TIME '13:00')::TIMESTAMP
+      ELSE NULL
+    END AS working_end
+  FROM pending_aligned AS pa
+  CROSS JOIN LATERAL GENERATE_SERIES(
+    pa.client_sent_at::DATE,
+    (SELECT now_local::DATE FROM params),
+    INTERVAL '1 day'
+  ) AS d
+),
+
+pending_per_day_clipped AS (
+  SELECT
+    client_id,
+    client_message_id,
+    client_sent_at,
+    now_local,
+    day,
+    CASE
+      WHEN working_start IS NULL OR working_end IS NULL THEN 0
+      ELSE GREATEST(
+        0,
+        EXTRACT(
+          EPOCH FROM (
+            LEAST(working_end, now_local)
+            - GREATEST(working_start, client_sent_at)
+          )
+        ) / 60.0
+      )
+    END AS minutes_in_day
+  FROM pending_per_day
+),
+
+pending_agg AS (
+  SELECT
+    client_id,
+    SUM(minutes_in_day) AS pending_response_minutes
+  FROM pending_per_day_clipped
+  GROUP BY client_id
+)
+
+SELECT
+  am.client_id,
+  am.avg_response_minutes_all,
+  am.avg_response_minutes_30d,
+  am.avg_response_minutes_7d,
+  am.last_response_minutes,
+  pa.pending_response_minutes
+FROM answered_metrics AS am
+LEFT JOIN pending_agg AS pa
+  ON pa.client_id = am.client_id;
