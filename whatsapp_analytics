@@ -1,0 +1,6 @@
+# WhatsApp Analytics
+
+SQL views and logic for WhatsApp message analysis:
+- Session detection
+- Monthly activity matrix
+- Response time (SLA) metrics
