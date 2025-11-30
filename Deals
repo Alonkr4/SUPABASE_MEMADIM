@@ -1,12 +1,5 @@
 CREATE SCHEMA IF NOT EXISTS ak_analytics;
 
-CREATE TABLE IF NOT EXISTS ak_analytics.deals_raw (
-    deal_id    TEXT PRIMARY KEY,      -- מזהה עסקה מה-CRM
-    payload    JSONB NOT NULL,        -- ה-JSON המלא כפי שמתקבל מה-API
-    fetched_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-
 CREATE TABLE IF NOT EXISTS ak_analytics.deals (
     deal_id                 TEXT PRIMARY KEY,
 
