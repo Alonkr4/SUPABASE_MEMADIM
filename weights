@@ -1,0 +1,28 @@
+create table if not exists ak_analytics.app_weights (
+  weight_id      bigserial primary key,
+
+  -- מזהה העסקה מפיירברי (כמו בטבלת deals)
+  deal_id        text not null,
+
+  -- זמנים מפיירברי
+  createdon      timestamptz not null,
+  modified_on    timestamptz,
+
+  -- נתוני תצפית
+  full_name      text,
+  weekly_steps   integer,
+  current_weight numeric,
+
+  -- האם נשלחה תמונה – נשמור כ-boolean, ואם אין לנו מיפוי ברור פשוט נשאיר null
+  pic_sent       boolean,
+
+  -- חותמת סנכרון (מתי נכתבה הרשומה בבסיס)
+  synced_at      timestamptz not null default now()
+);
+
+-- אינדקסים שימושיים
+create index if not exists idx_app_weights_deal_created
+  on ak_analytics.app_weights (deal_id, createdon);
+
+create index if not exists idx_app_weights_synced_at
+  on ak_analytics.app_weights (synced_at);
