@@ -1,0 +1,45 @@
+CREATE TABLE IF NOT EXISTS ak_analytics.urgency_metrics (
+    -- מזהה העסקה (PK, מגיע מהפייתון)
+    deal_id                   TEXT PRIMARY KEY,
+
+    -- תאריכים / מטא
+    calculated_at             TIMESTAMPTZ DEFAULT NOW(),   -- מתי חושב הציון עבור הלקוח
+    updated_at                TIMESTAMPTZ DEFAULT NOW(),   -- עדכון אחרון בשורה
+    etl_run_id                TEXT,                        -- מזהה ריצה מהפייתון (לוגים, דיבוג)
+    notes                     TEXT,                        -- הערות חישוב, סיבות מיוחדות וכו'
+
+    -- =============== Satisfaction ===============
+    satisfaction_service_rating    NUMERIC(5,2),   -- מתוך הסקרים (0–10 או מנורמל)
+    satisfaction_progress_sat      NUMERIC(5,2),
+    satisfaction_app_rating        NUMERIC(5,2),
+    satisfaction_final             NUMERIC(6,2),   -- 0–100 אחרי המשקולות
+
+    -- =============== Progress ===============
+    progress_score_total           NUMERIC(6,2),   -- ציון כלל-תהליכי 0–100
+    progress_score_2m              NUMERIC(6,2),   -- דגש על חודש/חודשיים אחרונים
+    progress_sat_score             NUMERIC(5,2),   -- מהסקרים
+    progress_final                 NUMERIC(6,2),   -- הציון המשוקלל 0–100
+
+    -- =============== Activity ===============
+    chat_activity_raw              NUMERIC(10,2),  -- לפני המרה ל-0–100 (מספר הודעות/שיחות)
+    chat_activity_score            NUMERIC(6,2),   -- מנורמל 0–100
+    surveys_activity               NUMERIC(6,2),   -- 0–100
+    weights_activity               NUMERIC(6,2),   -- 0–100
+    activity_final                 NUMERIC(6,2),   -- משוקלל 0–100
+
+    -- =============== Recency ===============
+    recency_score                  NUMERIC(6,2),   -- 0–100 לפי זמן מאז אינטראקציה אחרונה
+
+    -- =============== Urgency ===============
+    urgency_raw                    NUMERIC(10,2),  -- לפני קיטום/נרמול
+    urgency_score_final            NUMERIC(10,2),  -- הציון שאיתו עובדים בפועל
+    urgency_rank                   INTEGER,        -- דירוג / אחוזון באוכלוסייה
+    urgency_tag                    TEXT            -- "HIGH" / "MEDIUM" / "LOW" / "GREEN" וכו'
+);
+
+-- אינדקסים לדשבורדים / שאילתות
+CREATE INDEX IF NOT EXISTS urgency_metrics_score_idx
+    ON ak_analytics.urgency_metrics (urgency_score_final DESC);
+
+CREATE INDEX IF NOT EXISTS urgency_metrics_updated_idx
+    ON ak_analytics.urgency_metrics (updated_at DESC);
