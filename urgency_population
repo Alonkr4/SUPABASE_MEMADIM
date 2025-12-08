@@ -1,0 +1,23 @@
+CREATE OR REPLACE VIEW ak_analytics.urgency_population AS
+SELECT
+    d.deal_id,
+    d.status,
+    d.goal,
+    d.program_start,
+    d.program_end,
+    d.initial_weight,
+    d.recent_weight,
+    d.cons_opinion,
+    d.manager_opinion,
+    d.is_cotton,
+    d.niro_friend,
+    d.client_temp,
+    d.change_dir,
+    d.date_change_dir,
+    d.date_request_cancel,
+    d.date_exit_option_request,
+    d.last_weight_date
+FROM
+    ak_analytics.deals AS d
+WHERE
+    d.status IN (1, 8, 16);
