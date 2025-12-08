@@ -1,0 +1,24 @@
+create table ak_analytics.customer_service (
+  issue_id bigserial not null,
+  deal_id uuid not null,
+  full_name text null,
+  createdon timestamp with time zone null,
+  service_type text null,
+  retention_status text null,
+  date_completed timestamp with time zone null,
+  cancel_reason text null,
+  new_end_date date null,
+  retention_reason text null,
+  retention_method text null,
+  call_summary text null,
+  price_change_reason text null,
+  last_chance_status text null,
+  billing_status text null,
+  modifiedon timestamp with time zone null,
+  synced_at timestamp with time zone not null default now(),
+  constraint customer_service_pkey primary key (issue_id)
+) TABLESPACE pg_default;
+
+create index IF not exists customer_service_deal_id_idx on ak_analytics.customer_service using btree (deal_id) TABLESPACE pg_default;
+
+create index IF not exists customer_service_createdon_idx on ak_analytics.customer_service using btree (createdon) TABLESPACE pg_default;
