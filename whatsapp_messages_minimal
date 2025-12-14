@@ -1,0 +1,14 @@
+CREATE TABLE IF NOT EXISTS ak_analytics.whatsapp_messages_minimal (
+    message_id          BIGINT PRIMARY KEY,
+    deal_id             TEXT NOT NULL,
+    sent_at             TIMESTAMPTZ NOT NULL,
+    is_from_client      BOOLEAN NOT NULL,
+    synced_at           TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_wam_deal_sent 
+    ON ak_analytics.whatsapp_messages_minimal (deal_id, sent_at);
+
+CREATE INDEX IF NOT EXISTS idx_wam_sent_at 
+    ON ak_analytics.whatsapp_messages_minimal (sent_at);
+
