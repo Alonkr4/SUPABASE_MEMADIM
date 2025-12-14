@@ -1,0 +1,14 @@
+CREATE TABLE IF NOT EXISTS ak_analytics.urgency_monthly_snapshot (
+    deal_id             TEXT NOT NULL,
+    snapshot_month      DATE NOT NULL,
+    
+    satisfaction_final  NUMERIC(6,2),
+    progress_final      NUMERIC(6,2),
+    activity_final      NUMERIC(6,2),
+    urgency_score       NUMERIC(10,2),
+    urgency_tag         TEXT,
+    
+    created_at          TIMESTAMPTZ DEFAULT NOW(),
+    
+    PRIMARY KEY (deal_id, snapshot_month)
+);
