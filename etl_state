@@ -1,0 +1,15 @@
+CREATE TABLE IF NOT EXISTS ak_analytics.etl_state (
+    pipeline_name           TEXT PRIMARY KEY,
+    last_processed_at       TIMESTAMPTZ,
+    last_run_at             TIMESTAMPTZ,
+    rows_processed          INTEGER DEFAULT 0,
+    status                  TEXT DEFAULT 'idle',
+    error_message           TEXT,
+    notes                   TEXT,
+    updated_at              TIMESTAMPTZ DEFAULT NOW()
+);
+
+INSERT INTO ak_analytics.etl_state (pipeline_name, notes) 
+VALUES ('whatsapp_sync', 'Sync messages from public.messages to whatsapp_messages_minimal')
+ON CONFLICT (pipeline_name) DO NOTHING;
+
