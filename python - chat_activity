@@ -1,0 +1,320 @@
+from dotenv import load_dotenv
+import os
+from supabase import create_client
+import pandas as pd
+from datetime import datetime, timedelta
+
+# Load credentials
+load_dotenv()
+
+supabase = create_client(
+    os.getenv("SUPABASE_URL"),
+    os.getenv("SUPABASE_KEY")
+)
+supabase_ak = supabase.schema("ak_analytics")
+
+# Session gap: 10 minutes
+SESSION_GAP_MINUTES = 10
+
+
+def fetch_messages(days_back=60):
+    """Fetch messages from whatsapp_messages_minimal"""
+    
+    cutoff_date = (datetime.now() - timedelta(days=days_back)).isoformat()
+    
+    # Fetch all messages (paginated if needed)
+    all_messages = []
+    offset = 0
+    batch_size = 1000
+    
+    while True:
+        result = supabase_ak.table("whatsapp_messages_minimal") \
+            .select("message_id, deal_id, sent_at, is_from_client") \
+            .gte("sent_at", cutoff_date) \
+            .order("sent_at") \
+            .range(offset, offset + batch_size - 1) \
+            .execute()
+        
+        all_messages.extend(result.data)
+        
+        if len(result.data) < batch_size:
+            break
+        offset += batch_size
+        print(f"Fetched {offset} messages...")
+    
+    print(f"Total messages fetched: {len(all_messages)}")
+    return pd.DataFrame(all_messages)
+
+
+def detect_sessions(df):
+    """
+    Detect sessions based on 10-minute gap.
+    Returns DataFrame with session info.
+    """
+    
+    if df.empty:
+        return pd.DataFrame()
+    
+    # Convert sent_at to datetime
+    df['sent_at'] = pd.to_datetime(df['sent_at'])
+    
+    # Sort by client and time
+    df = df.sort_values(['deal_id', 'sent_at'])
+    
+    # Calculate time gap from previous message (per client)
+    df['prev_sent_at'] = df.groupby('deal_id')['sent_at'].shift(1)
+    df['gap_minutes'] = (df['sent_at'] - df['prev_sent_at']).dt.total_seconds() / 60
+    
+    # New session if gap > 10 min (or first message)
+    df['is_new_session'] = (df['gap_minutes'] > SESSION_GAP_MINUTES) | (df['gap_minutes'].isna())
+    
+    # Client started session = first message of session is from client
+    df['client_started_session'] = df['is_new_session'] & df['is_from_client']
+    
+    return df
+
+
+def calculate_daily_stats(df):
+    """Calculate daily statistics per client"""
+    
+    if df.empty:
+        return pd.DataFrame()
+    
+    # Add date column
+    df['activity_date'] = df['sent_at'].dt.date
+    
+    # Group by client and date
+    daily_stats = df.groupby(['deal_id', 'activity_date']).agg(
+        total_messages_day=('message_id', 'count'),
+        total_sessions_day=('is_new_session', 'sum'),
+        client_started_sessions_day=('client_started_session', 'sum')
+    ).reset_index()
+    
+    # Convert to int
+    daily_stats['total_sessions_day'] = daily_stats['total_sessions_day'].astype(int)
+    daily_stats['client_started_sessions_day'] = daily_stats['client_started_sessions_day'].astype(int)
+    
+    return daily_stats
+
+
+def calculate_all_time_stats(df):
+    """Calculate all-time statistics per client"""
+    
+    if df.empty:
+        return pd.DataFrame()
+    
+    all_time_stats = df.groupby('deal_id').agg(
+        total_messages=('message_id', 'count'),
+        total_sessions=('is_new_session', 'sum'),
+        client_started_sessions=('client_started_session', 'sum'),
+        last_message_at=('sent_at', 'max')
+    ).reset_index()
+    
+    # Convert to int
+    all_time_stats['total_sessions'] = all_time_stats['total_sessions'].astype(int)
+    all_time_stats['client_started_sessions'] = all_time_stats['client_started_sessions'].astype(int)
+    
+    return all_time_stats
+
+
+def calculate_chat_activity_score(stats_df, days):
+    """
+    Calculate chat activity score using formula:
+    (1.2 * avg_daily_client_sessions + avg_daily_agent_sessions) * msgs_per_session
+    """
+    
+    if stats_df.empty:
+        return stats_df
+    
+    df = stats_df.copy()
+    
+    # Agent started sessions
+    df['agent_started_sessions'] = df['total_sessions'] - df['client_started_sessions']
+    
+    # Averages per day
+    df['avg_daily_client_sessions'] = df['client_started_sessions'] / days
+    df['avg_daily_agent_sessions'] = df['agent_started_sessions'] / days
+    
+    # Messages per session
+    df['msgs_per_session'] = df.apply(
+        lambda row: row['total_messages'] / row['total_sessions'] if row['total_sessions'] > 0 else 0,
+        axis=1
+    )
+    
+    # Activity score formula
+    df['activity_score'] = (
+        (1.2 * df['avg_daily_client_sessions'] + df['avg_daily_agent_sessions']) 
+        * df['msgs_per_session']
+    )
+    
+    return df
+
+
+def calculate_30_60_day_activity(daily_stats_df):
+    """
+    Calculate activity_30 and activity_prev30 from daily stats.
+    activity_60d = 0.6 * activity_30 + 0.4 * activity_prev30
+    """
+    
+    if daily_stats_df.empty:
+        return pd.DataFrame()
+    
+    today = datetime.now().date()
+    thirty_days_ago = today - timedelta(days=30)
+    sixty_days_ago = today - timedelta(days=60)
+    
+    # Convert activity_date to date type if needed
+    daily_stats_df['activity_date'] = pd.to_datetime(daily_stats_df['activity_date']).dt.date
+    
+    # Last 30 days
+    last_30 = daily_stats_df[daily_stats_df['activity_date'] > thirty_days_ago]
+    stats_30 = last_30.groupby('deal_id').agg(
+        total_sessions=('total_sessions_day', 'sum'),
+        client_started_sessions=('client_started_sessions_day', 'sum'),
+        total_messages=('total_messages_day', 'sum')
+    ).reset_index()
+    stats_30 = calculate_chat_activity_score(stats_30, 30)
+    stats_30 = stats_30.rename(columns={'activity_score': 'activity_30'})
+    
+    # Previous 30 days (31-60)
+    prev_30 = daily_stats_df[
+        (daily_stats_df['activity_date'] > sixty_days_ago) & 
+        (daily_stats_df['activity_date'] <= thirty_days_ago)
+    ]
+    stats_prev30 = prev_30.groupby('deal_id').agg(
+        total_sessions=('total_sessions_day', 'sum'),
+        client_started_sessions=('client_started_sessions_day', 'sum'),
+        total_messages=('total_messages_day', 'sum')
+    ).reset_index()
+    stats_prev30 = calculate_chat_activity_score(stats_prev30, 30)
+    stats_prev30 = stats_prev30.rename(columns={'activity_score': 'activity_prev30'})
+    
+    # Merge
+    result = stats_30[['deal_id', 'activity_30']].merge(
+        stats_prev30[['deal_id', 'activity_prev30']], 
+        on='deal_id', 
+        how='outer'
+    ).fillna(0)
+    
+    # Calculate weighted 60-day score
+    result['chat_activity_60d'] = 0.6 * result['activity_30'] + 0.4 * result['activity_prev30']
+    
+    return result
+
+
+def save_daily_stats(daily_stats_df):
+    """Save daily stats to chat_activity_daily table"""
+    
+    if daily_stats_df.empty:
+        print("No daily stats to save.")
+        return
+    
+    # Prepare data for upsert
+    records = daily_stats_df.to_dict('records')
+    
+    # Convert date to string for JSON
+    for record in records:
+        record['activity_date'] = str(record['activity_date'])
+        record['updated_at'] = datetime.now().isoformat()
+    
+    # Upsert in batches
+    batch_size = 500
+    for i in range(0, len(records), batch_size):
+        batch = records[i:i+batch_size]
+        supabase_ak.table("chat_activity_daily").upsert(batch).execute()
+        print(f"Saved daily stats batch {i//batch_size + 1}")
+    
+    print(f"Total daily stats saved: {len(records)}")
+
+
+def save_all_time_stats(all_time_stats_df):
+    """Save all-time stats to chat_activity_state_all_time table"""
+    
+    if all_time_stats_df.empty:
+        print("No all-time stats to save.")
+        return
+    
+    # Prepare data for upsert
+    records = all_time_stats_df[['deal_id', 'total_sessions', 'client_started_sessions', 
+                                   'total_messages', 'last_message_at']].to_dict('records')
+    
+    # Convert timestamp to string for JSON
+    for record in records:
+        if pd.notna(record['last_message_at']):
+            record['last_message_at'] = record['last_message_at'].isoformat()
+        record['updated_at'] = datetime.now().isoformat()
+    
+    # Upsert in batches
+    batch_size = 500
+    for i in range(0, len(records), batch_size):
+        batch = records[i:i+batch_size]
+        supabase_ak.table("chat_activity_state_all_time").upsert(batch).execute()
+        print(f"Saved all-time stats batch {i//batch_size + 1}")
+    
+    print(f"Total all-time stats saved: {len(records)}")
+
+
+def run_chat_activity_calculation():
+    """Main function to run chat activity calculation"""
+    
+    print("=" * 60)
+    print("CHAT ACTIVITY CALCULATION")
+    print("=" * 60)
+    
+    # Step 1: Fetch messages
+    print("\n1. Fetching messages (last 60 days)...")
+    messages_df = fetch_messages(days_back=60)
+    
+    if messages_df.empty:
+        print("No messages found. Make sure whatsapp_messages_minimal has data.")
+        return None
+    
+    # Step 2: Detect sessions
+    print("\n2. Detecting sessions...")
+    sessions_df = detect_sessions(messages_df)
+    session_count = sessions_df['is_new_session'].sum()
+    print(f"Total sessions detected: {session_count}")
+    
+    # Step 3: Calculate daily stats
+    print("\n3. Calculating daily stats...")
+    daily_stats = calculate_daily_stats(sessions_df)
+    print(f"Daily stats rows: {len(daily_stats)}")
+    
+    # Step 4: Calculate all-time stats
+    print("\n4. Calculating all-time stats...")
+    all_time_stats = calculate_all_time_stats(sessions_df)
+    print(f"Clients with stats: {len(all_time_stats)}")
+    
+    # Step 5: Calculate 30/60 day activity scores
+    print("\n5. Calculating 30/60 day activity scores...")
+    activity_scores = calculate_30_60_day_activity(daily_stats)
+    print(f"Activity scores calculated: {len(activity_scores)}")
+    
+    # Step 6: Save to database
+    print("\n6. Saving to database...")
+    save_daily_stats(daily_stats)
+    save_all_time_stats(all_time_stats)
+    
+    print("\n" + "=" * 60)
+    print("CHAT ACTIVITY CALCULATION COMPLETE")
+    print("=" * 60)
+    
+    return {
+        'daily_stats': daily_stats,
+        'all_time_stats': all_time_stats,
+        'activity_scores': activity_scores
+    }
+
+
+# Run if executed directly
+if __name__ == "__main__":
+    result = run_chat_activity_calculation()
+    
+    if result:
+        print("\n--- Sample Activity Scores ---")
+        print(result['activity_scores'].head(10))
+
+
+
+
+
