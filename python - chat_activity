@@ -1,8 +1,28 @@
+"""
+Chat Activity Processor
+Calculates chat activity metrics from WhatsApp messages.
+
+Modes:
+  chunk      - Process next 10K messages (run multiple times until done)
+  daily      - Process only new messages since last run
+  finalize   - Calculate final scores after all chunks done
+  status     - Show current progress
+
+Usage:
+  python chat_activity.py chunk       # Run ~23 times for 230K messages
+  python chat_activity.py daily       # After historical is done, run daily
+  python chat_activity.py finalize    # Calculate final chat_activity scores
+  python chat_activity.py status      # Check progress
+
+Session detection: 15-minute gap = new session
+"""
+
 from dotenv import load_dotenv
 import os
 from supabase import create_client
 import pandas as pd
 from datetime import datetime, timedelta
+import time
 
 # Load credentials
 load_dotenv()
@@ -13,66 +33,292 @@ supabase = create_client(
 )
 supabase_ak = supabase.schema("ak_analytics")
 
-# Session gap: 10 minutes
-SESSION_GAP_MINUTES = 10
+# Configuration
+SESSION_GAP_MINUTES = 15
+PIPELINE_NAME = 'chat_activity'
+CHUNK_SIZE = 10000          # Messages per chunk run
+BATCH_SIZE_READ = 1000      # Rows per read batch
+BATCH_SIZE_WRITE = 500      # Rows per write batch
+DELAY_READ = 0.5            # Seconds between read batches
+DELAY_WRITE = 0.3           # Seconds between write batches
 
 
-def fetch_messages(days_back=60):
-    """Fetch messages from whatsapp_messages_minimal"""
+# ============================================================
+# ETL STATE FUNCTIONS
+# ============================================================
+
+def get_pipeline_state():
+    """Get full pipeline state from etl_state"""
+    result = supabase_ak.table("etl_state") \
+        .select("*") \
+        .eq("pipeline_name", PIPELINE_NAME) \
+        .execute()
     
-    cutoff_date = (datetime.now() - timedelta(days=days_back)).isoformat()
+    if result.data:
+        return result.data[0]
+    return None
+
+
+def get_last_processed_at():
+    """Get the last processed timestamp from etl_state"""
+    state = get_pipeline_state()
+    if state and state['last_processed_at']:
+        return state['last_processed_at']
+    return None
+
+
+def update_pipeline_state(last_processed_at, rows_processed, status, notes=None):
+    """Update etl_state with current progress"""
+    data = {
+        'pipeline_name': PIPELINE_NAME,
+        'last_processed_at': last_processed_at,
+        'last_run_at': datetime.now().isoformat(),
+        'rows_processed': rows_processed,
+        'status': status,
+        'updated_at': datetime.now().isoformat()
+    }
+    if notes:
+        data['notes'] = notes
+    supabase_ak.table("etl_state").upsert(data).execute()
+
+
+def set_status(status, error_message=None):
+    """Update pipeline status"""
+    data = {
+        'pipeline_name': PIPELINE_NAME,
+        'status': status,
+        'updated_at': datetime.now().isoformat()
+    }
+    if error_message:
+        data['error_message'] = error_message
+    supabase_ak.table("etl_state").upsert(data).execute()
+
+
+# ============================================================
+# COUNT FUNCTIONS
+# ============================================================
+
+def count_total_messages():
+    """Count total messages in whatsapp_messages_minimal"""
+    result = supabase_ak.table("whatsapp_messages_minimal") \
+        .select("message_id", count="exact") \
+        .execute()
+    return result.count
+
+
+def count_messages_after(timestamp):
+    """Count messages after given timestamp"""
+    if timestamp is None:
+        return count_total_messages()
     
-    # Fetch all messages (paginated if needed)
+    result = supabase_ak.table("whatsapp_messages_minimal") \
+        .select("message_id", count="exact") \
+        .gt("sent_at", timestamp) \
+        .execute()
+    return result.count
+
+
+def count_processed_messages():
+    """Count messages in chat_activity_state_all_time"""
+    result = supabase_ak.table("chat_activity_state_all_time") \
+        .select("total_messages") \
+        .execute()
+    
+    if result.data:
+        return sum(row['total_messages'] for row in result.data)
+    return 0
+
+
+# ============================================================
+# FETCH FUNCTIONS (with delays)
+# ============================================================
+
+def fetch_messages_chunk(since_timestamp, limit=CHUNK_SIZE):
+    """Fetch a chunk of messages after given timestamp"""
+    
     all_messages = []
     offset = 0
-    batch_size = 1000
     
-    while True:
-        result = supabase_ak.table("whatsapp_messages_minimal") \
+    while len(all_messages) < limit:
+        batch_limit = min(BATCH_SIZE_READ, limit - len(all_messages))
+        
+        query = supabase_ak.table("whatsapp_messages_minimal") \
             .select("message_id, deal_id, sent_at, is_from_client") \
-            .gte("sent_at", cutoff_date) \
-            .order("sent_at") \
-            .range(offset, offset + batch_size - 1) \
-            .execute()
+            .order("sent_at")
+        
+        if since_timestamp:
+            query = query.gt("sent_at", since_timestamp)
+        
+        result = query.range(offset, offset + batch_limit - 1).execute()
         
         all_messages.extend(result.data)
         
-        if len(result.data) < batch_size:
+        if len(result.data) < batch_limit:
             break
-        offset += batch_size
-        print(f"Fetched {offset} messages...")
+        
+        offset += batch_limit
+        print(f"  Fetched {len(all_messages)} / {limit} messages...")
+        
+        # Delay between batches
+        time.sleep(DELAY_READ)
     
-    print(f"Total messages fetched: {len(all_messages)}")
+    print(f"  Total fetched: {len(all_messages)}")
     return pd.DataFrame(all_messages)
 
 
-def detect_sessions(df):
+def fetch_messages_since(since_timestamp):
+    """Fetch ALL messages newer than given timestamp (for daily mode)"""
+    
+    all_messages = []
+    offset = 0
+    
+    while True:
+        query = supabase_ak.table("whatsapp_messages_minimal") \
+            .select("message_id, deal_id, sent_at, is_from_client") \
+            .order("sent_at")
+        
+        if since_timestamp:
+            query = query.gt("sent_at", since_timestamp)
+        
+        result = query.range(offset, offset + BATCH_SIZE_READ - 1).execute()
+        
+        all_messages.extend(result.data)
+        
+        if len(result.data) < BATCH_SIZE_READ:
+            break
+        
+        offset += BATCH_SIZE_READ
+        print(f"  Fetched {len(all_messages)} messages...")
+        time.sleep(DELAY_READ)
+    
+    print(f"  Total fetched: {len(all_messages)}")
+    return pd.DataFrame(all_messages)
+
+
+def fetch_existing_state(deal_ids):
+    """Fetch existing state for specific clients"""
+    
+    if not deal_ids:
+        return pd.DataFrame()
+    
+    all_states = []
+    deal_ids_list = list(deal_ids)
+    batch_size = 100  # Supabase IN query limit
+    
+    for i in range(0, len(deal_ids_list), batch_size):
+        batch = deal_ids_list[i:i+batch_size]
+        result = supabase_ak.table("chat_activity_state_all_time") \
+            .select("*") \
+            .in_("deal_id", batch) \
+            .execute()
+        all_states.extend(result.data)
+        time.sleep(DELAY_READ)
+    
+    return pd.DataFrame(all_states)
+
+
+def fetch_all_daily_stats():
+    """Fetch all daily stats for final calculation"""
+    
+    all_stats = []
+    offset = 0
+    
+    while True:
+        result = supabase_ak.table("chat_activity_daily") \
+            .select("*") \
+            .range(offset, offset + BATCH_SIZE_READ - 1) \
+            .execute()
+        
+        all_stats.extend(result.data)
+        
+        if len(result.data) < BATCH_SIZE_READ:
+            break
+        
+        offset += BATCH_SIZE_READ
+        time.sleep(DELAY_READ)
+    
+    return pd.DataFrame(all_stats)
+
+
+def fetch_all_time_stats():
+    """Fetch all-time stats for final calculation"""
+    
+    all_stats = []
+    offset = 0
+    
+    while True:
+        result = supabase_ak.table("chat_activity_state_all_time") \
+            .select("*") \
+            .range(offset, offset + BATCH_SIZE_READ - 1) \
+            .execute()
+        
+        all_stats.extend(result.data)
+        
+        if len(result.data) < BATCH_SIZE_READ:
+            break
+        
+        offset += BATCH_SIZE_READ
+        time.sleep(DELAY_READ)
+    
+    return pd.DataFrame(all_stats)
+
+
+# ============================================================
+# SESSION DETECTION
+# ============================================================
+
+def detect_sessions(df, existing_state_df=None):
     """
-    Detect sessions based on 10-minute gap.
-    Returns DataFrame with session info.
+    Detect sessions based on 15-minute gap.
+    
+    For chunk/daily mode: uses existing last_message_at to determine
+    if first message is new session or continuation.
     """
     
     if df.empty:
         return pd.DataFrame()
     
-    # Convert sent_at to datetime
+    df = df.copy()
     df['sent_at'] = pd.to_datetime(df['sent_at'])
-    
-    # Sort by client and time
     df = df.sort_values(['deal_id', 'sent_at'])
     
-    # Calculate time gap from previous message (per client)
-    df['prev_sent_at'] = df.groupby('deal_id')['sent_at'].shift(1)
+    # For incremental mode: merge existing last_message_at
+    if existing_state_df is not None and not existing_state_df.empty:
+        existing_state_df = existing_state_df.copy()
+        existing_state_df['last_message_at'] = pd.to_datetime(existing_state_df['last_message_at'])
+        df = df.merge(
+            existing_state_df[['deal_id', 'last_message_at']], 
+            on='deal_id', 
+            how='left',
+            suffixes=('', '_existing')
+        )
+    else:
+        df['last_message_at'] = pd.NaT
+    
+    # Calculate previous message time (within this batch)
+    df['prev_sent_at_batch'] = df.groupby('deal_id')['sent_at'].shift(1)
+    
+    # For first message of each client in batch, use existing last_message_at
+    df['prev_sent_at'] = df['prev_sent_at_batch'].fillna(df['last_message_at'])
+    
+    # Calculate gap
     df['gap_minutes'] = (df['sent_at'] - df['prev_sent_at']).dt.total_seconds() / 60
     
-    # New session if gap > 10 min (or first message)
+    # New session if gap > 15 min (or first message ever)
     df['is_new_session'] = (df['gap_minutes'] > SESSION_GAP_MINUTES) | (df['gap_minutes'].isna())
     
     # Client started session = first message of session is from client
     df['client_started_session'] = df['is_new_session'] & df['is_from_client']
     
+    # Clean up temp columns
+    df = df.drop(columns=['prev_sent_at_batch', 'prev_sent_at', 'last_message_at', 'gap_minutes'], errors='ignore')
+    
     return df
 
+
+# ============================================================
+# CALCULATION FUNCTIONS
+# ============================================================
 
 def calculate_daily_stats(df):
     """Calculate daily statistics per client"""
@@ -80,241 +326,619 @@ def calculate_daily_stats(df):
     if df.empty:
         return pd.DataFrame()
     
-    # Add date column
+    df = df.copy()
     df['activity_date'] = df['sent_at'].dt.date
     
-    # Group by client and date
     daily_stats = df.groupby(['deal_id', 'activity_date']).agg(
         total_messages_day=('message_id', 'count'),
         total_sessions_day=('is_new_session', 'sum'),
         client_started_sessions_day=('client_started_session', 'sum')
     ).reset_index()
     
-    # Convert to int
     daily_stats['total_sessions_day'] = daily_stats['total_sessions_day'].astype(int)
     daily_stats['client_started_sessions_day'] = daily_stats['client_started_sessions_day'].astype(int)
     
     return daily_stats
 
 
-def calculate_all_time_stats(df):
-    """Calculate all-time statistics per client"""
+def calculate_batch_stats(df):
+    """Calculate statistics for a batch of messages"""
     
     if df.empty:
         return pd.DataFrame()
     
-    all_time_stats = df.groupby('deal_id').agg(
-        total_messages=('message_id', 'count'),
-        total_sessions=('is_new_session', 'sum'),
-        client_started_sessions=('client_started_session', 'sum'),
-        last_message_at=('sent_at', 'max')
+    batch_stats = df.groupby('deal_id').agg(
+        new_messages=('message_id', 'count'),
+        new_sessions=('is_new_session', 'sum'),
+        new_client_started=('client_started_session', 'sum'),
+        batch_last_message_at=('sent_at', 'max')
     ).reset_index()
     
-    # Convert to int
-    all_time_stats['total_sessions'] = all_time_stats['total_sessions'].astype(int)
-    all_time_stats['client_started_sessions'] = all_time_stats['client_started_sessions'].astype(int)
+    batch_stats['new_sessions'] = batch_stats['new_sessions'].astype(int)
+    batch_stats['new_client_started'] = batch_stats['new_client_started'].astype(int)
     
-    return all_time_stats
+    return batch_stats
 
 
-def calculate_chat_activity_score(stats_df, days):
+def calculate_activity_score(total_sessions, client_started, total_messages, days):
     """
-    Calculate chat activity score using formula:
+    Calculate activity score using formula:
     (1.2 * avg_daily_client_sessions + avg_daily_agent_sessions) * msgs_per_session
     """
+    
+    if total_sessions == 0:
+        return 0
+    
+    agent_started = total_sessions - client_started
+    avg_daily_client = client_started / days
+    avg_daily_agent = agent_started / days
+    msgs_per_session = total_messages / total_sessions
+    
+    return (1.2 * avg_daily_client + avg_daily_agent) * msgs_per_session
+
+
+def calculate_activity_scores_df(stats_df, days):
+    """Calculate activity scores for a DataFrame"""
     
     if stats_df.empty:
         return stats_df
     
     df = stats_df.copy()
     
-    # Agent started sessions
-    df['agent_started_sessions'] = df['total_sessions'] - df['client_started_sessions']
-    
-    # Averages per day
-    df['avg_daily_client_sessions'] = df['client_started_sessions'] / days
-    df['avg_daily_agent_sessions'] = df['agent_started_sessions'] / days
-    
-    # Messages per session
-    df['msgs_per_session'] = df.apply(
-        lambda row: row['total_messages'] / row['total_sessions'] if row['total_sessions'] > 0 else 0,
+    df['activity_score'] = df.apply(
+        lambda row: calculate_activity_score(
+            row['total_sessions'],
+            row['client_started_sessions'],
+            row['total_messages'],
+            days
+        ),
         axis=1
-    )
-    
-    # Activity score formula
-    df['activity_score'] = (
-        (1.2 * df['avg_daily_client_sessions'] + df['avg_daily_agent_sessions']) 
-        * df['msgs_per_session']
     )
     
     return df
 
 
-def calculate_30_60_day_activity(daily_stats_df):
-    """
-    Calculate activity_30 and activity_prev30 from daily stats.
-    activity_60d = 0.6 * activity_30 + 0.4 * activity_prev30
-    """
-    
-    if daily_stats_df.empty:
-        return pd.DataFrame()
-    
-    today = datetime.now().date()
-    thirty_days_ago = today - timedelta(days=30)
-    sixty_days_ago = today - timedelta(days=60)
-    
-    # Convert activity_date to date type if needed
-    daily_stats_df['activity_date'] = pd.to_datetime(daily_stats_df['activity_date']).dt.date
-    
-    # Last 30 days
-    last_30 = daily_stats_df[daily_stats_df['activity_date'] > thirty_days_ago]
-    stats_30 = last_30.groupby('deal_id').agg(
-        total_sessions=('total_sessions_day', 'sum'),
-        client_started_sessions=('client_started_sessions_day', 'sum'),
-        total_messages=('total_messages_day', 'sum')
-    ).reset_index()
-    stats_30 = calculate_chat_activity_score(stats_30, 30)
-    stats_30 = stats_30.rename(columns={'activity_score': 'activity_30'})
-    
-    # Previous 30 days (31-60)
-    prev_30 = daily_stats_df[
-        (daily_stats_df['activity_date'] > sixty_days_ago) & 
-        (daily_stats_df['activity_date'] <= thirty_days_ago)
-    ]
-    stats_prev30 = prev_30.groupby('deal_id').agg(
-        total_sessions=('total_sessions_day', 'sum'),
-        client_started_sessions=('client_started_sessions_day', 'sum'),
-        total_messages=('total_messages_day', 'sum')
-    ).reset_index()
-    stats_prev30 = calculate_chat_activity_score(stats_prev30, 30)
-    stats_prev30 = stats_prev30.rename(columns={'activity_score': 'activity_prev30'})
-    
-    # Merge
-    result = stats_30[['deal_id', 'activity_30']].merge(
-        stats_prev30[['deal_id', 'activity_prev30']], 
-        on='deal_id', 
-        how='outer'
-    ).fillna(0)
-    
-    # Calculate weighted 60-day score
-    result['chat_activity_60d'] = 0.6 * result['activity_30'] + 0.4 * result['activity_prev30']
-    
-    return result
-
+# ============================================================
+# SAVE FUNCTIONS (with delays)
+# ============================================================
 
 def save_daily_stats(daily_stats_df):
     """Save daily stats to chat_activity_daily table"""
     
     if daily_stats_df.empty:
-        print("No daily stats to save.")
+        print("  No daily stats to save.")
         return
     
-    # Prepare data for upsert
     records = daily_stats_df.to_dict('records')
     
-    # Convert date to string for JSON
     for record in records:
         record['activity_date'] = str(record['activity_date'])
         record['updated_at'] = datetime.now().isoformat()
     
-    # Upsert in batches
-    batch_size = 500
-    for i in range(0, len(records), batch_size):
-        batch = records[i:i+batch_size]
+    for i in range(0, len(records), BATCH_SIZE_WRITE):
+        batch = records[i:i+BATCH_SIZE_WRITE]
         supabase_ak.table("chat_activity_daily").upsert(batch).execute()
-        print(f"Saved daily stats batch {i//batch_size + 1}")
+        print(f"  Saved daily stats: {i + len(batch)} / {len(records)}")
+        time.sleep(DELAY_WRITE)
     
-    print(f"Total daily stats saved: {len(records)}")
+    print(f"  Daily stats saved: {len(records)} rows")
 
 
-def save_all_time_stats(all_time_stats_df):
-    """Save all-time stats to chat_activity_state_all_time table"""
+def save_all_time_stats_first_chunk(all_time_df):
+    """Save all-time stats - FIRST CHUNK (insert/replace)"""
     
-    if all_time_stats_df.empty:
-        print("No all-time stats to save.")
+    if all_time_df.empty:
+        print("  No all-time stats to save.")
         return
     
-    # Prepare data for upsert
-    records = all_time_stats_df[['deal_id', 'total_sessions', 'client_started_sessions', 
-                                   'total_messages', 'last_message_at']].to_dict('records')
+    records = all_time_df[['deal_id', 'total_sessions', 'client_started_sessions', 
+                           'total_messages', 'last_message_at']].to_dict('records')
     
-    # Convert timestamp to string for JSON
     for record in records:
-        if pd.notna(record['last_message_at']):
-            record['last_message_at'] = record['last_message_at'].isoformat()
+        if pd.notna(record.get('last_message_at')):
+            if hasattr(record['last_message_at'], 'isoformat'):
+                record['last_message_at'] = record['last_message_at'].isoformat()
         record['updated_at'] = datetime.now().isoformat()
     
-    # Upsert in batches
-    batch_size = 500
-    for i in range(0, len(records), batch_size):
-        batch = records[i:i+batch_size]
+    for i in range(0, len(records), BATCH_SIZE_WRITE):
+        batch = records[i:i+BATCH_SIZE_WRITE]
         supabase_ak.table("chat_activity_state_all_time").upsert(batch).execute()
-        print(f"Saved all-time stats batch {i//batch_size + 1}")
+        print(f"  Saved all-time stats: {i + len(batch)} / {len(records)}")
+        time.sleep(DELAY_WRITE)
     
-    print(f"Total all-time stats saved: {len(records)}")
+    print(f"  All-time stats saved: {len(records)} clients")
 
 
-def run_chat_activity_calculation():
-    """Main function to run chat activity calculation"""
+def save_all_time_stats_incremental(batch_stats_df, existing_state_df):
+    """Save all-time stats - INCREMENTAL (add to existing)"""
+    
+    if batch_stats_df.empty:
+        print("  No new stats to save.")
+        return
+    
+    # Merge new batch with existing state
+    merged = batch_stats_df.merge(
+        existing_state_df[['deal_id', 'total_sessions', 'client_started_sessions', 'total_messages']], 
+        on='deal_id', 
+        how='left',
+        suffixes=('', '_existing')
+    ).fillna(0)
+    
+    # Add new to existing
+    merged['total_sessions'] = merged['total_sessions_existing'] + merged['new_sessions']
+    merged['client_started_sessions'] = merged['client_started_sessions_existing'] + merged['new_client_started']
+    merged['total_messages'] = merged['total_messages_existing'] + merged['new_messages']
+    merged['last_message_at'] = merged['batch_last_message_at']
+    
+    # Prepare records
+    records = merged[['deal_id', 'total_sessions', 'client_started_sessions', 
+                      'total_messages', 'last_message_at']].to_dict('records')
+    
+    for record in records:
+        record['total_sessions'] = int(record['total_sessions'])
+        record['client_started_sessions'] = int(record['client_started_sessions'])
+        record['total_messages'] = int(record['total_messages'])
+        if pd.notna(record.get('last_message_at')):
+            if hasattr(record['last_message_at'], 'isoformat'):
+                record['last_message_at'] = record['last_message_at'].isoformat()
+        record['updated_at'] = datetime.now().isoformat()
+    
+    for i in range(0, len(records), BATCH_SIZE_WRITE):
+        batch = records[i:i+BATCH_SIZE_WRITE]
+        supabase_ak.table("chat_activity_state_all_time").upsert(batch).execute()
+        print(f"  Saved all-time stats: {i + len(batch)} / {len(records)}")
+        time.sleep(DELAY_WRITE)
+    
+    print(f"  All-time stats updated: {len(records)} clients")
+
+
+def save_final_scores(scores_df):
+    """Save final chat_activity scores to urgency_metrics"""
+    
+    if scores_df.empty:
+        print("  No scores to save.")
+        return
+    
+    records = scores_df[['deal_id', 'chat_activity_all', 'activity_30', 
+                         'activity_prev30', 'chat_activity']].to_dict('records')
+    
+    for record in records:
+        record['updated_at'] = datetime.now().isoformat()
+    
+    for i in range(0, len(records), BATCH_SIZE_WRITE):
+        batch = records[i:i+BATCH_SIZE_WRITE]
+        supabase_ak.table("urgency_metrics").upsert(batch).execute()
+        print(f"  Saved final scores: {i + len(batch)} / {len(records)}")
+        time.sleep(DELAY_WRITE)
+    
+    print(f"  Final scores saved: {len(records)} clients")
+
+
+# ============================================================
+# MAIN FUNCTIONS
+# ============================================================
+
+def show_status():
+    """Show current processing status"""
     
     print("=" * 60)
-    print("CHAT ACTIVITY CALCULATION")
+    print("CHAT ACTIVITY - STATUS")
     print("=" * 60)
     
-    # Step 1: Fetch messages
-    print("\n1. Fetching messages (last 60 days)...")
-    messages_df = fetch_messages(days_back=60)
+    # Get counts
+    total_messages = count_total_messages()
+    last_processed = get_last_processed_at()
+    remaining = count_messages_after(last_processed)
+    processed = total_messages - remaining
     
-    if messages_df.empty:
-        print("No messages found. Make sure whatsapp_messages_minimal has data.")
+    # Get pipeline state
+    state = get_pipeline_state()
+    
+    print(f"\nTotal messages in whatsapp_messages_minimal: {total_messages:,}")
+    print(f"Messages processed: {processed:,}")
+    print(f"Messages remaining: {remaining:,}")
+    print(f"Progress: {processed / total_messages * 100:.1f}%")
+    
+    if remaining > 0:
+        chunks_remaining = (remaining + CHUNK_SIZE - 1) // CHUNK_SIZE
+        print(f"\nChunks remaining: {chunks_remaining} (at {CHUNK_SIZE:,} per chunk)")
+    
+    if state:
+        print(f"\nLast processed at: {state.get('last_processed_at', 'Never')}")
+        print(f"Last run at: {state.get('last_run_at', 'Never')}")
+        print(f"Status: {state.get('status', 'Unknown')}")
+    
+    print("=" * 60)
+
+
+def run_chunk():
+    """
+    CHUNK MODE - Process next 10K messages.
+    Run multiple times until all messages processed.
+    """
+    
+    print("=" * 60)
+    print("CHUNK MODE - Processing next 10K messages")
+    print("=" * 60)
+    
+    # Get current state
+    last_processed = get_last_processed_at()
+    total_messages = count_total_messages()
+    remaining_before = count_messages_after(last_processed)
+    
+    print(f"\nTotal messages: {total_messages:,}")
+    print(f"Remaining: {remaining_before:,}")
+    
+    if remaining_before == 0:
+        print("\n✓ All messages already processed!")
+        print("Run 'python chat_activity.py finalize' to calculate final scores.")
         return None
     
-    # Step 2: Detect sessions
-    print("\n2. Detecting sessions...")
-    sessions_df = detect_sessions(messages_df)
-    session_count = sessions_df['is_new_session'].sum()
-    print(f"Total sessions detected: {session_count}")
+    is_first_chunk = (last_processed is None)
+    if is_first_chunk:
+        print("\nThis is the FIRST chunk - will create initial state.")
+    else:
+        print(f"\nContinuing from: {last_processed}")
     
-    # Step 3: Calculate daily stats
-    print("\n3. Calculating daily stats...")
-    daily_stats = calculate_daily_stats(sessions_df)
-    print(f"Daily stats rows: {len(daily_stats)}")
+    set_status('running')
     
-    # Step 4: Calculate all-time stats
-    print("\n4. Calculating all-time stats...")
-    all_time_stats = calculate_all_time_stats(sessions_df)
-    print(f"Clients with stats: {len(all_time_stats)}")
+    try:
+        # Step 1: Fetch chunk
+        print("\n1. Fetching messages...")
+        messages_df = fetch_messages_chunk(last_processed, limit=CHUNK_SIZE)
+        
+        if messages_df.empty:
+            print("No messages to process.")
+            set_status('completed')
+            return None
+        
+        # Step 2: Get existing state for affected clients (if not first chunk)
+        existing_state_df = pd.DataFrame()
+        if not is_first_chunk:
+            print("\n2. Fetching existing state...")
+            affected_clients = set(messages_df['deal_id'].unique())
+            existing_state_df = fetch_existing_state(affected_clients)
+            print(f"  Clients with existing state: {len(existing_state_df)}")
+        else:
+            print("\n2. First chunk - no existing state to fetch.")
+        
+        # Step 3: Detect sessions
+        print("\n3. Detecting sessions...")
+        sessions_df = detect_sessions(messages_df, existing_state_df if not is_first_chunk else None)
+        session_count = sessions_df['is_new_session'].sum()
+        print(f"  Sessions detected: {int(session_count)}")
+        
+        # Step 4: Calculate daily stats
+        print("\n4. Calculating daily stats...")
+        daily_stats = calculate_daily_stats(sessions_df)
+        print(f"  Daily stats rows: {len(daily_stats)}")
+        
+        # Step 5: Calculate batch stats
+        print("\n5. Calculating batch stats...")
+        batch_stats = calculate_batch_stats(sessions_df)
+        
+        # Step 6: Save to database
+        print("\n6. Saving to database...")
+        save_daily_stats(daily_stats)
+        
+        if is_first_chunk:
+            # First chunk: calculate all-time from this batch
+            all_time_stats = sessions_df.groupby('deal_id').agg(
+                total_sessions=('is_new_session', 'sum'),
+                client_started_sessions=('client_started_session', 'sum'),
+                total_messages=('message_id', 'count'),
+                last_message_at=('sent_at', 'max')
+            ).reset_index()
+            all_time_stats['total_sessions'] = all_time_stats['total_sessions'].astype(int)
+            all_time_stats['client_started_sessions'] = all_time_stats['client_started_sessions'].astype(int)
+            save_all_time_stats_first_chunk(all_time_stats)
+        else:
+            # Subsequent chunks: add to existing
+            save_all_time_stats_incremental(batch_stats, existing_state_df)
+        
+        # Step 7: Update etl_state
+        max_sent_at = messages_df['sent_at'].max()
+        if hasattr(max_sent_at, 'isoformat'):
+            max_sent_at = max_sent_at.isoformat()
+        
+        remaining_after = count_messages_after(max_sent_at)
+        chunks_remaining = (remaining_after + CHUNK_SIZE - 1) // CHUNK_SIZE if remaining_after > 0 else 0
+        
+        update_pipeline_state(
+            last_processed_at=max_sent_at,
+            rows_processed=len(messages_df),
+            status='completed' if remaining_after == 0 else 'in_progress',
+            notes=f"Processed chunk of {len(messages_df)} messages"
+        )
+        
+        # Summary
+        print("\n" + "=" * 60)
+        print("CHUNK COMPLETE")
+        print("=" * 60)
+        print(f"  Messages processed this chunk: {len(messages_df):,}")
+        print(f"  Sessions detected: {int(session_count)}")
+        print(f"  Messages remaining: {remaining_after:,}")
+        print(f"  Chunks remaining: {chunks_remaining}")
+        
+        if remaining_after > 0:
+            print(f"\n→ Run 'python chat_activity.py chunk' again to continue.")
+        else:
+            print(f"\n✓ All messages processed!")
+            print("→ Run 'python chat_activity.py finalize' to calculate final scores.")
+        
+        return {
+            'messages_processed': len(messages_df),
+            'sessions_detected': int(session_count),
+            'remaining': remaining_after,
+            'chunks_remaining': chunks_remaining
+        }
+        
+    except Exception as e:
+        set_status('failed', str(e))
+        raise
+
+
+def run_daily():
+    """
+    DAILY MODE - Process only new messages since last run.
+    Use this after historical processing is complete.
+    """
     
-    # Step 5: Calculate 30/60 day activity scores
-    print("\n5. Calculating 30/60 day activity scores...")
-    activity_scores = calculate_30_60_day_activity(daily_stats)
-    print(f"Activity scores calculated: {len(activity_scores)}")
-    
-    # Step 6: Save to database
-    print("\n6. Saving to database...")
-    save_daily_stats(daily_stats)
-    save_all_time_stats(all_time_stats)
-    
-    print("\n" + "=" * 60)
-    print("CHAT ACTIVITY CALCULATION COMPLETE")
+    print("=" * 60)
+    print("DAILY MODE - Processing new messages only")
     print("=" * 60)
     
-    return {
-        'daily_stats': daily_stats,
-        'all_time_stats': all_time_stats,
-        'activity_scores': activity_scores
-    }
-
-
-# Run if executed directly
-if __name__ == "__main__":
-    result = run_chat_activity_calculation()
+    set_status('running')
     
-    if result:
-        print("\n--- Sample Activity Scores ---")
-        print(result['activity_scores'].head(10))
+    try:
+        # Step 1: Get last processed timestamp
+        print("\n1. Checking last processed timestamp...")
+        last_processed = get_last_processed_at()
+        
+        if last_processed is None:
+            print("  No previous run found. Run chunk mode first:")
+            print("  python chat_activity.py chunk")
+            set_status('idle')
+            return None
+        
+        print(f"  Last processed: {last_processed}")
+        
+        # Step 2: Fetch new messages
+        print("\n2. Fetching new messages...")
+        messages_df = fetch_messages_since(last_processed)
+        
+        if messages_df.empty:
+            print("  No new messages to process.")
+            set_status('completed')
+            return None
+        
+        # Step 3: Get existing state for affected clients
+        print("\n3. Fetching existing state...")
+        affected_clients = set(messages_df['deal_id'].unique())
+        existing_state_df = fetch_existing_state(affected_clients)
+        print(f"  Clients with existing state: {len(existing_state_df)}")
+        
+        # Step 4: Detect sessions
+        print("\n4. Detecting sessions...")
+        sessions_df = detect_sessions(messages_df, existing_state_df)
+        new_sessions = sessions_df['is_new_session'].sum()
+        print(f"  New sessions detected: {int(new_sessions)}")
+        
+        # Step 5: Calculate daily stats
+        print("\n5. Calculating daily stats...")
+        daily_stats = calculate_daily_stats(sessions_df)
+        print(f"  Daily stats rows: {len(daily_stats)}")
+        
+        # Step 6: Calculate batch stats
+        print("\n6. Calculating batch stats...")
+        batch_stats = calculate_batch_stats(sessions_df)
+        
+        # Step 7: Save to database
+        print("\n7. Saving to database...")
+        save_daily_stats(daily_stats)
+        save_all_time_stats_incremental(batch_stats, existing_state_df)
+        
+        # Step 8: Update etl_state
+        max_sent_at = messages_df['sent_at'].max()
+        if hasattr(max_sent_at, 'isoformat'):
+            max_sent_at = max_sent_at.isoformat()
+        
+        update_pipeline_state(
+            last_processed_at=max_sent_at,
+            rows_processed=len(messages_df),
+            status='completed',
+            notes=f"Daily run: {len(messages_df)} messages"
+        )
+        
+        print("\n" + "=" * 60)
+        print("DAILY MODE COMPLETE")
+        print(f"  Messages processed: {len(messages_df)}")
+        print(f"  Sessions detected: {int(new_sessions)}")
+        print(f"  Clients updated: {len(affected_clients)}")
+        print("=" * 60)
+        
+        return {
+            'messages_processed': len(messages_df),
+            'sessions_detected': int(new_sessions),
+            'clients_updated': len(affected_clients)
+        }
+        
+    except Exception as e:
+        set_status('failed', str(e))
+        raise
 
 
+def run_finalize():
+    """
+    FINALIZE MODE - Calculate final chat_activity scores.
+    Run after all chunks are processed.
+    
+    Formula: chat_activity = 0.75 * chat_activity_all + 0.15 * activity_30 + 0.10 * activity_prev30
+    """
+    
+    print("=" * 60)
+    print("FINALIZE MODE - Calculating final scores")
+    print("=" * 60)
+    
+    # Check if there are remaining messages
+    last_processed = get_last_processed_at()
+    remaining = count_messages_after(last_processed)
+    
+    if remaining > 0:
+        print(f"\nWARNING: {remaining:,} messages not yet processed!")
+        print("Run 'python chat_activity.py chunk' until all messages are done.")
+        response = input("Continue anyway? (y/n): ")
+        if response.lower() != 'y':
+            return None
+    
+    try:
+        # Step 1: Fetch all-time stats
+        print("\n1. Fetching all-time stats...")
+        all_time_df = fetch_all_time_stats()
+        print(f"  Clients: {len(all_time_df)}")
+        
+        if all_time_df.empty:
+            print("  No all-time stats found. Run chunk mode first.")
+            return None
+        
+        # Calculate all-time activity score
+        # Using average days active (rough estimate based on data range)
+        print("\n2. Calculating all-time activity scores...")
+        daily_df = fetch_all_daily_stats()
+        
+        if daily_df.empty:
+            print("  No daily stats found.")
+            return None
+        
+        # Calculate days span per client
+        daily_df['activity_date'] = pd.to_datetime(daily_df['activity_date'])
+        days_per_client = daily_df.groupby('deal_id').agg(
+            min_date=('activity_date', 'min'),
+            max_date=('activity_date', 'max')
+        ).reset_index()
+        days_per_client['days_span'] = (days_per_client['max_date'] - days_per_client['min_date']).dt.days + 1
+        
+        # Merge days with all-time stats
+        all_time_df = all_time_df.merge(days_per_client[['deal_id', 'days_span']], on='deal_id', how='left')
+        all_time_df['days_span'] = all_time_df['days_span'].fillna(1).clip(lower=1)
+        
+        # Calculate chat_activity_all
+        all_time_df['chat_activity_all'] = all_time_df.apply(
+            lambda row: calculate_activity_score(
+                row['total_sessions'],
+                row['client_started_sessions'],
+                row['total_messages'],
+                row['days_span']
+            ),
+            axis=1
+        )
+        
+        # Step 3: Calculate 30-day and prev-30-day scores
+        print("\n3. Calculating 30/60 day scores...")
+        today = datetime.now().date()
+        thirty_days_ago = today - timedelta(days=30)
+        sixty_days_ago = today - timedelta(days=60)
+        
+        daily_df['activity_date_dt'] = daily_df['activity_date'].dt.date
+        
+        # Last 30 days
+        last_30 = daily_df[daily_df['activity_date_dt'] > thirty_days_ago]
+        stats_30 = last_30.groupby('deal_id').agg(
+            total_sessions=('total_sessions_day', 'sum'),
+            client_started_sessions=('client_started_sessions_day', 'sum'),
+            total_messages=('total_messages_day', 'sum')
+        ).reset_index()
+        stats_30['activity_30'] = stats_30.apply(
+            lambda row: calculate_activity_score(
+                row['total_sessions'],
+                row['client_started_sessions'],
+                row['total_messages'],
+                30
+            ),
+            axis=1
+        )
+        
+        # Previous 30 days (31-60)
+        prev_30 = daily_df[
+            (daily_df['activity_date_dt'] > sixty_days_ago) & 
+            (daily_df['activity_date_dt'] <= thirty_days_ago)
+        ]
+        stats_prev30 = prev_30.groupby('deal_id').agg(
+            total_sessions=('total_sessions_day', 'sum'),
+            client_started_sessions=('client_started_sessions_day', 'sum'),
+            total_messages=('total_messages_day', 'sum')
+        ).reset_index()
+        stats_prev30['activity_prev30'] = stats_prev30.apply(
+            lambda row: calculate_activity_score(
+                row['total_sessions'],
+                row['client_started_sessions'],
+                row['total_messages'],
+                30
+            ),
+            axis=1
+        )
+        
+        # Step 4: Merge all scores
+        print("\n4. Merging scores...")
+        final_scores = all_time_df[['deal_id', 'chat_activity_all']].merge(
+            stats_30[['deal_id', 'activity_30']], on='deal_id', how='left'
+        ).merge(
+            stats_prev30[['deal_id', 'activity_prev30']], on='deal_id', how='left'
+        ).fillna(0)
+        
+        # Step 5: Calculate final chat_activity
+        print("\n5. Calculating final chat_activity...")
+        final_scores['chat_activity'] = (
+            0.75 * final_scores['chat_activity_all'] +
+            0.15 * final_scores['activity_30'] +
+            0.10 * final_scores['activity_prev30']
+        )
+        
+        # Round to 2 decimals
+        for col in ['chat_activity_all', 'activity_30', 'activity_prev30', 'chat_activity']:
+            final_scores[col] = final_scores[col].round(2)
+        
+        # Step 6: Save to urgency_metrics
+        print("\n6. Saving to urgency_metrics...")
+        save_final_scores(final_scores)
+        
+        print("\n" + "=" * 60)
+        print("FINALIZE COMPLETE")
+        print("=" * 60)
+        print(f"  Clients scored: {len(final_scores)}")
+        print(f"\nSample scores:")
+        print(final_scores.head(10).to_string(index=False))
+        
+        return final_scores
+        
+    except Exception as e:
+        set_status('failed', str(e))
+        raise
 
 
+# ============================================================
+# COMMAND LINE INTERFACE
+# ============================================================
 
+if __name__ == "__main__":
+    import sys
+    
+    if len(sys.argv) > 1:
+        mode = sys.argv[1].lower()
+    else:
+        mode = 'status'
+    
+    if mode == 'chunk':
+        run_chunk()
+    elif mode == 'daily':
+        run_daily()
+    elif mode == 'finalize':
+        run_finalize()
+    elif mode == 'status':
+        show_status()
+    else:
+        print("Usage:")
+        print("  python chat_activity.py status     # Check progress")
+        print("  python chat_activity.py chunk      # Process next 10K messages")
+        print("  python chat_activity.py daily      # Process new messages (after historical)")
+        print("  python chat_activity.py finalize   # Calculate final scores")
