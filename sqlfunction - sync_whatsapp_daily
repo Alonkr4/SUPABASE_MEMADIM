@@ -1,0 +1,103 @@
+CREATE OR REPLACE FUNCTION ak_analytics.sync_whatsapp_daily()
+RETURNS TABLE(
+    total_synced_this_run INTEGER,
+    batches_run INTEGER,
+    remaining_gap BIGINT,
+    final_status TEXT
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_last_processed TIMESTAMPTZ;
+    v_synced_batch INTEGER;
+    v_max_sent_at TIMESTAMPTZ;
+    v_total_synced INTEGER := 0;
+    v_batches INTEGER := 0;
+    v_gap BIGINT;
+    v_batch_size INTEGER := 3000;
+    v_max_batches INTEGER := 10;  -- Safety limit: max 30,000 messages per run
+BEGIN
+    -- Calculate initial gap
+    SELECT 
+        (SELECT COUNT(*) FROM public.messages) - 
+        (SELECT COUNT(*) FROM ak_analytics.whatsapp_messages_minimal)
+    INTO v_gap;
+
+    -- Update status to running
+    UPDATE ak_analytics.etl_state
+    SET status = 'running', last_run_at = NOW(), updated_at = NOW()
+    WHERE pipeline_name = 'whatsapp_sync';
+
+    -- Loop until gap < 100 or max batches reached
+    WHILE v_gap >= 100 AND v_batches < v_max_batches LOOP
+        
+        -- Get last processed timestamp
+        SELECT last_processed_at INTO v_last_processed
+        FROM ak_analytics.etl_state
+        WHERE pipeline_name = 'whatsapp_sync';
+
+        -- Insert batch
+        WITH inserted AS (
+            INSERT INTO ak_analytics.whatsapp_messages_minimal 
+                (message_id, deal_id, sent_at, is_from_client)
+            SELECT 
+                m.id,
+                m.client_id::text,
+                m.sent_at,
+                (m.direction = 'incoming')
+            FROM public.messages m
+            WHERE (v_last_processed IS NULL OR m.sent_at > v_last_processed)
+            ORDER BY m.sent_at ASC
+            LIMIT v_batch_size
+            ON CONFLICT (message_id) DO NOTHING
+            RETURNING sent_at
+        )
+        SELECT COUNT(*)::INTEGER, MAX(sent_at)
+        INTO v_synced_batch, v_max_sent_at
+        FROM inserted;
+
+        -- Update counters
+        v_total_synced := v_total_synced + v_synced_batch;
+        v_batches := v_batches + 1;
+
+        -- Update etl_state with progress
+        UPDATE ak_analytics.etl_state
+        SET 
+            last_processed_at = COALESCE(v_max_sent_at, last_processed_at),
+            rows_processed = v_synced_batch,
+            updated_at = NOW()
+        WHERE pipeline_name = 'whatsapp_sync';
+
+        -- Exit if no more to sync
+        IF v_synced_batch = 0 THEN
+            EXIT;
+        END IF;
+
+        -- Recalculate gap
+        SELECT 
+            (SELECT COUNT(*) FROM public.messages) - 
+            (SELECT COUNT(*) FROM ak_analytics.whatsapp_messages_minimal)
+        INTO v_gap;
+
+    END LOOP;
+
+    -- Final status update
+    UPDATE ak_analytics.etl_state
+    SET 
+        status = 'completed',
+        notes = format('Synced %s messages in %s batches', v_total_synced, v_batches),
+        updated_at = NOW()
+    WHERE pipeline_name = 'whatsapp_sync';
+
+    -- Return summary
+    RETURN QUERY SELECT 
+        v_total_synced,
+        v_batches,
+        v_gap,
+        CASE 
+            WHEN v_gap < 100 THEN 'complete'
+            WHEN v_batches >= v_max_batches THEN 'max_batches_reached'
+            ELSE 'complete'
+        END;
+END;
+$$;
